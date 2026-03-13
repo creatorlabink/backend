@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import authRoutes from './routes/auth';
 import ebookRoutes from './routes/ebooks';
 import pdfRoutes from './routes/pdf';
+import paymentRoutes from './routes/payment';
 
 dotenv.config();
 
@@ -12,13 +13,15 @@ const PORT = process.env.PORT || 4000;
 
 // ─── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000', credentials: true }));
+// NOTE: Stripe webhook in payment routes uses its own raw-body parser before this
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
-app.use('/api/auth', authRoutes);
-app.use('/api/ebooks', ebookRoutes);   // Phase 3 placeholder
-app.use('/api/pdf', pdfRoutes);         // Phase 3 placeholder
+app.use('/api/auth',    authRoutes);
+app.use('/api/ebooks',  ebookRoutes);
+app.use('/api/pdf',     pdfRoutes);
+app.use('/api/payment', paymentRoutes);
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
