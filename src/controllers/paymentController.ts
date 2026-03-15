@@ -8,12 +8,19 @@ import Stripe from 'stripe';
 import pool from '../config/db';
 import { AuthRequest } from '../middleware/auth';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY ?? '', {
-  apiVersion: '2026-02-25.clover',
-});
+// Lazy accessor – prevents crash on startup when STRIPE_SECRET_KEY is not yet set
+let _stripe: Stripe | null = null;
+function getStripe(): Stripe {
+  if (!_stripe) {
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (!key) throw new Error('STRIPE_SECRET_KEY is not set in .env');
+    _stripe = new Stripe(key, { apiVersion: '2026-02-25.clover' });
+  }
+  return _stripe;
+}
 
 const EARLY_ADOPTER_PRICE_CENTS = 1197; // $11.97
-const EARLY_ADOPTER_LABEL = 'CreatorLab.ink – Lifetime Access (Early Adopter)';
+const EARLY_ADOPTER_LABEL = 'Creatorlab – Lifetime Access (Early Adopter)';
 
 // ── POST /api/payment/checkout ─────────────────────────────────────────────
 export const createCheckout = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -31,7 +38,7 @@ export const createCheckout = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const session = await stripe.checkout.sessions.create({
+    const session = await getStripe().checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
       customer_email: email,
@@ -78,7 +85,7 @@ export const verifySession = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const session = await getStripe().checkout.sessions.retrieve(sessionId);
 
     if (session.payment_status === 'paid' && session.metadata?.userId) {
       await pool.query(
@@ -112,7 +119,7 @@ export const stripeWebhook = async (req: Request, res: Response): Promise<void> 
 
   let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, secret);
+    event = getStripe().webhooks.constructEvent(req.body, sig, secret);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Webhook error';
     console.error('Webhook signature error:', message);

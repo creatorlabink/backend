@@ -8,6 +8,7 @@ import { AuthRequest } from '../middleware/auth';
 import pool from '../config/db';
 import { generatePdfFromParsed } from '../utils/pdfUtils';
 import { parseText } from '../utils/textParser';
+import { trackEvent } from '../utils/analyticsUtils';
 
 // POST /api/pdf/export/:ebookId
 export const exportPdf = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -50,8 +51,15 @@ export const exportPdf = async (req: AuthRequest, res: Response): Promise<void> 
       parsed.title = ebook.title;
     }
 
-    // TODO Phase 4: Apply template-aware styles based on ebook.template
-    generatePdfFromParsed(parsed, name ?? '', res);
+    const aiApplied = Boolean(ebook.formatted_json?.ai_applied);
+    await trackEvent('pdf_download', {
+      userId,
+      ebookId: ebook.id,
+      template: ebook.template ?? 'minimal',
+      aiApplied,
+      source: 'pdf_export',
+    });
+    generatePdfFromParsed(parsed, name ?? '', res, ebook.template ?? 'minimal', aiApplied);
   } catch (err) {
     console.error('exportPdf error:', err);
     if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
@@ -70,9 +78,16 @@ export const previewEbook = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
     const ebook = result.rows[0];
-    const parsed = parseText(ebook.raw_text || '', ebook.title);
+    const parsed = ebook.formatted_json?.sections
+      ? { title: ebook.title, ...ebook.formatted_json }
+      : parseText(ebook.raw_text || '', ebook.title);
     parsed.title = ebook.title;
-    res.json({ parsed });
+    res.json({
+      parsed,
+      template: ebook.template ?? 'minimal',
+      ai_applied: Boolean(ebook.formatted_json?.ai_applied),
+      ai_source: ebook.formatted_json?.ai_source ?? 'manual',
+    });
   } catch (err) {
     console.error('previewEbook error:', err);
     res.status(500).json({ error: 'Internal server error' });

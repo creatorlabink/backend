@@ -1,7 +1,315 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import pool from '../config/db';
 import { signToken } from '../utils/jwtUtils';
+import { trackEvent } from '../utils/analyticsUtils';
+
+type OAuthProvider = 'google' | 'tiktok';
+type OAuthIntent = 'login' | 'signup';
+
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
+
+const GOOGLE_AUTH_URL = process.env.GOOGLE_OAUTH_AUTHORIZE_URL || 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_URL = process.env.GOOGLE_OAUTH_TOKEN_URL || 'https://oauth2.googleapis.com/token';
+const GOOGLE_USERINFO_URL = process.env.GOOGLE_USERINFO_URL || 'https://openidconnect.googleapis.com/v1/userinfo';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${CLIENT_URL}/auth/oauth/callback`;
+const GOOGLE_SCOPES = process.env.GOOGLE_OAUTH_SCOPES || 'openid email profile';
+
+const TIKTOK_AUTH_URL = process.env.TIKTOK_OAUTH_AUTHORIZE_URL || 'https://www.tiktok.com/v2/auth/authorize/';
+const TIKTOK_TOKEN_URL = process.env.TIKTOK_OAUTH_TOKEN_URL || 'https://open.tiktokapis.com/v2/oauth/token/';
+const TIKTOK_USERINFO_URL = process.env.TIKTOK_USERINFO_URL || 'https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,avatar_url';
+const TIKTOK_CLIENT_ID = process.env.TIKTOK_CLIENT_ID || process.env.TIKTOK_CLIENT_KEY || '';
+const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || '';
+const TIKTOK_REDIRECT_URI = process.env.TIKTOK_REDIRECT_URI || `${CLIENT_URL}/auth/oauth/callback`;
+const TIKTOK_SCOPES = process.env.TIKTOK_OAUTH_SCOPES || 'user.info.basic';
+
+let oauthTablesReady = false;
+
+interface OAuthTokenResult {
+  accessToken: string;
+  refreshToken?: string;
+  expiresIn?: number;
+}
+
+interface OAuthProfile {
+  providerUserId: string;
+  email: string;
+  name: string | null;
+}
+
+async function ensureOAuthTables(): Promise<void> {
+  if (oauthTablesReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS social_identities (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider VARCHAR(30) NOT NULL,
+      provider_user_id VARCHAR(255) NOT NULL,
+      email VARCHAR(255),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(provider, provider_user_id),
+      UNIQUE(user_id, provider)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS oauth_auth_states (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      provider VARCHAR(30) NOT NULL,
+      state TEXT NOT NULL UNIQUE,
+      intent VARCHAR(20) NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_oauth_states_provider ON oauth_auth_states(provider, expires_at)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_social_identities_user ON social_identities(user_id, provider)');
+
+  oauthTablesReady = true;
+}
+
+function validateProvider(provider: string): provider is OAuthProvider {
+  return provider === 'google' || provider === 'tiktok';
+}
+
+function getProviderConfig(provider: OAuthProvider) {
+  if (provider === 'google') {
+    return {
+      clientId: GOOGLE_CLIENT_ID,
+      clientSecret: GOOGLE_CLIENT_SECRET,
+      authUrl: GOOGLE_AUTH_URL,
+      tokenUrl: GOOGLE_TOKEN_URL,
+      userInfoUrl: GOOGLE_USERINFO_URL,
+      redirectUri: GOOGLE_REDIRECT_URI,
+      scopes: GOOGLE_SCOPES,
+    };
+  }
+
+  return {
+    clientId: TIKTOK_CLIENT_ID,
+    clientSecret: TIKTOK_CLIENT_SECRET,
+    authUrl: TIKTOK_AUTH_URL,
+    tokenUrl: TIKTOK_TOKEN_URL,
+    userInfoUrl: TIKTOK_USERINFO_URL,
+    redirectUri: TIKTOK_REDIRECT_URI,
+    scopes: TIKTOK_SCOPES,
+  };
+}
+
+async function createOAuthState(provider: OAuthProvider, intent: OAuthIntent): Promise<string> {
+  await ensureOAuthTables();
+
+  const state = crypto.randomBytes(24).toString('hex');
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+  await pool.query(
+    'INSERT INTO oauth_auth_states (provider, state, intent, expires_at) VALUES ($1, $2, $3, $4)',
+    [provider, state, intent, expiresAt]
+  );
+
+  return state;
+}
+
+async function consumeOAuthState(provider: OAuthProvider, state: string): Promise<OAuthIntent> {
+  await ensureOAuthTables();
+
+  await pool.query('DELETE FROM oauth_auth_states WHERE expires_at < NOW()');
+
+  const result = await pool.query(
+    `DELETE FROM oauth_auth_states
+     WHERE provider = $1 AND state = $2 AND expires_at >= NOW()
+     RETURNING intent`,
+    [provider, state]
+  );
+
+  if (!result.rows.length) {
+    throw new Error('Invalid or expired OAuth state');
+  }
+
+  return result.rows[0].intent as OAuthIntent;
+}
+
+async function exchangeOAuthCode(provider: OAuthProvider, code: string): Promise<OAuthTokenResult> {
+  const cfg = getProviderConfig(provider);
+
+  if (provider === 'google') {
+    const response = await fetch(cfg.tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        code,
+        client_id: cfg.clientId,
+        client_secret: cfg.clientSecret,
+        redirect_uri: cfg.redirectUri,
+        grant_type: 'authorization_code',
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Google token exchange failed (${response.status})`);
+    }
+
+    const json = (await response.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+    if (!json.access_token) {
+      throw new Error('Google access token missing');
+    }
+    return {
+      accessToken: json.access_token,
+      refreshToken: json.refresh_token,
+      expiresIn: json.expires_in,
+    };
+  }
+
+  const response = await fetch(cfg.tokenUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      code,
+      client_key: cfg.clientId,
+      client_secret: cfg.clientSecret,
+      redirect_uri: cfg.redirectUri,
+      grant_type: 'authorization_code',
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`TikTok token exchange failed (${response.status})`);
+  }
+
+  const json = (await response.json()) as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    data?: { access_token?: string; refresh_token?: string; expires_in?: number };
+  };
+
+  const accessToken = json.access_token || json.data?.access_token;
+  if (!accessToken) {
+    throw new Error('TikTok access token missing');
+  }
+
+  return {
+    accessToken,
+    refreshToken: json.refresh_token || json.data?.refresh_token,
+    expiresIn: json.expires_in || json.data?.expires_in,
+  };
+}
+
+async function fetchOAuthProfile(provider: OAuthProvider, accessToken: string): Promise<OAuthProfile> {
+  const cfg = getProviderConfig(provider);
+
+  if (provider === 'google') {
+    const response = await fetch(cfg.userInfoUrl, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Google userinfo failed (${response.status})`);
+    }
+
+    const json = (await response.json()) as {
+      sub?: string;
+      email?: string;
+      name?: string;
+      given_name?: string;
+    };
+
+    if (!json.sub) {
+      throw new Error('Google profile missing sub');
+    }
+
+    return {
+      providerUserId: json.sub,
+      email: json.email || `google_${json.sub}@google.local`,
+      name: json.name || json.given_name || null,
+    };
+  }
+
+  const response = await fetch(cfg.userInfoUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`TikTok userinfo failed (${response.status})`);
+  }
+
+  const json = (await response.json()) as {
+    data?: {
+      user?: {
+        open_id?: string;
+        display_name?: string;
+      };
+    };
+  };
+
+  const openId = json.data?.user?.open_id;
+  if (!openId) {
+    throw new Error('TikTok profile missing open_id');
+  }
+
+  return {
+    providerUserId: openId,
+    email: `tiktok_${openId}@tiktok.local`,
+    name: json.data?.user?.display_name || null,
+  };
+}
+
+async function findOrCreateSocialUser(provider: OAuthProvider, profile: OAuthProfile) {
+  await ensureOAuthTables();
+
+  const identity = await pool.query(
+    `SELECT u.id, u.email, u.name
+     FROM social_identities si
+     JOIN users u ON u.id = si.user_id
+     WHERE si.provider = $1 AND si.provider_user_id = $2`,
+    [provider, profile.providerUserId]
+  );
+
+  if (identity.rows.length) {
+    return identity.rows[0] as { id: string; email: string; name: string | null };
+  }
+
+  const existingUser = await pool.query('SELECT id, email, name FROM users WHERE email = $1', [profile.email]);
+  let user: { id: string; email: string; name: string | null };
+
+  if (existingUser.rows.length) {
+    user = existingUser.rows[0];
+  } else {
+    const randomPassword = crypto.randomBytes(32).toString('hex');
+    const passwordHash = await bcrypt.hash(randomPassword, 12);
+    const inserted = await pool.query(
+      `INSERT INTO users (email, password_hash, name)
+       VALUES ($1, $2, $3)
+       RETURNING id, email, name`,
+      [profile.email, passwordHash, profile.name]
+    );
+    user = inserted.rows[0];
+  }
+
+  await pool.query(
+    `INSERT INTO social_identities (user_id, provider, provider_user_id, email, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, NOW(), NOW())
+     ON CONFLICT (provider, provider_user_id)
+     DO UPDATE SET user_id = EXCLUDED.user_id, email = EXCLUDED.email, updated_at = NOW()`,
+    [user.id, provider, profile.providerUserId, profile.email]
+  );
+
+  return user;
+}
 
 // ─── Signup ───────────────────────────────────────────────────────────────────
 export const signup = async (req: Request, res: Response): Promise<void> => {
@@ -29,6 +337,12 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
 
     const user = result.rows[0];
     const token = signToken({ userId: user.id, email: user.email });
+
+    await trackEvent('signup', {
+      userId: user.id,
+      source: 'auth_signup',
+      metadata: { email: user.email },
+    });
 
     res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name } });
   } catch (err) {
@@ -67,6 +381,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
     const token = signToken({ userId: user.id, email: user.email });
 
+    await trackEvent('login', {
+      userId: user.id,
+      source: 'auth_login',
+      metadata: { email: user.email },
+    });
+
     res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
   } catch (err) {
     console.error('Login error:', err);
@@ -91,5 +411,91 @@ export const getMe = async (req: Request & { user?: { userId: string; email: str
   } catch (err) {
     console.error('GetMe error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ─── OAuth connect URL ───────────────────────────────────────────────────────
+export const oauthConnectUrl = async (req: Request, res: Response): Promise<void> => {
+  const providerRaw = Array.isArray(req.params.provider) ? req.params.provider[0] : req.params.provider;
+  if (!validateProvider(providerRaw)) {
+    res.status(400).json({ error: 'Unsupported OAuth provider' });
+    return;
+  }
+
+  const provider = providerRaw;
+  const cfg = getProviderConfig(provider);
+
+  if (!cfg.clientId || !cfg.clientSecret) {
+    res.status(500).json({ error: `${provider} OAuth is not configured on server.` });
+    return;
+  }
+
+  const intentRaw = (req.query.intent as string | undefined) || 'login';
+  const intent: OAuthIntent = intentRaw === 'signup' ? 'signup' : 'login';
+
+  try {
+    const state = await createOAuthState(provider, intent);
+    const url = new URL(cfg.authUrl);
+
+    if (provider === 'google') {
+      url.searchParams.set('client_id', cfg.clientId);
+      url.searchParams.set('redirect_uri', cfg.redirectUri);
+      url.searchParams.set('response_type', 'code');
+      url.searchParams.set('scope', cfg.scopes);
+      url.searchParams.set('access_type', 'offline');
+      url.searchParams.set('prompt', 'consent');
+      url.searchParams.set('state', state);
+    } else {
+      url.searchParams.set('client_key', cfg.clientId);
+      url.searchParams.set('redirect_uri', cfg.redirectUri);
+      url.searchParams.set('response_type', 'code');
+      url.searchParams.set('scope', cfg.scopes);
+      url.searchParams.set('state', state);
+    }
+
+    res.json({ provider, intent, state, url: url.toString() });
+  } catch (err) {
+    console.error('oauthConnectUrl error:', err);
+    res.status(500).json({ error: 'Failed to start social login.' });
+  }
+};
+
+// ─── OAuth exchange code ─────────────────────────────────────────────────────
+export const oauthExchangeCode = async (req: Request, res: Response): Promise<void> => {
+  const providerRaw = Array.isArray(req.params.provider) ? req.params.provider[0] : req.params.provider;
+  if (!validateProvider(providerRaw)) {
+    res.status(400).json({ error: 'Unsupported OAuth provider' });
+    return;
+  }
+
+  const provider = providerRaw;
+  const { code, state } = req.body as { code?: string; state?: string };
+
+  if (!code || !state) {
+    res.status(400).json({ error: 'code and state are required' });
+    return;
+  }
+
+  try {
+    const intent = await consumeOAuthState(provider, state);
+    const tokenResult = await exchangeOAuthCode(provider, code);
+    const profile = await fetchOAuthProfile(provider, tokenResult.accessToken);
+    const user = await findOrCreateSocialUser(provider, profile);
+
+    const token = signToken({ userId: user.id, email: user.email });
+
+    await trackEvent('login', {
+      userId: user.id,
+      source: `oauth_${provider}`,
+      metadata: {
+        provider,
+        intent,
+      },
+    });
+
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name }, provider });
+  } catch (err) {
+    console.error('oauthExchangeCode error:', err);
+    res.status(500).json({ error: 'Social login failed. Please try again.' });
   }
 };

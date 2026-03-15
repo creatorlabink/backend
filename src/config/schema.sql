@@ -38,6 +38,39 @@ CREATE TABLE IF NOT EXISTS payments (
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Integration connections (OAuth tokens for external publishing platforms)
+CREATE TABLE IF NOT EXISTS integration_connections (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider VARCHAR(80) NOT NULL,
+  access_token_enc TEXT,
+  refresh_token_enc TEXT,
+  token_expires_at TIMESTAMPTZ,
+  oauth_state TEXT,
+  account_id TEXT,
+  account_username TEXT,
+  scopes TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, provider)
+);
+
+-- Publish job history for external integrations
+CREATE TABLE IF NOT EXISTS integration_publish_jobs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ebook_id UUID NOT NULL REFERENCES ebooks(id) ON DELETE CASCADE,
+  provider VARCHAR(80) NOT NULL,
+  external_import_id TEXT,
+  external_product_id TEXT,
+  status VARCHAR(40) NOT NULL DEFAULT 'queued',
+  response_json JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_ebooks_user_id ON ebooks(user_id);
 CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_integration_connections_user_provider ON integration_connections(user_id, provider);
+CREATE INDEX IF NOT EXISTS idx_integration_publish_jobs_user ON integration_publish_jobs(user_id, provider, created_at DESC);
