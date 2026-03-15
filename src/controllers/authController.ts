@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import pool from '../config/db';
 import { signToken } from '../utils/jwtUtils';
 import { trackEvent } from '../utils/analyticsUtils';
+import { sendWelcomeEmail } from '../utils/emailUtils';
 
 type OAuthProvider = 'google' | 'tiktok';
 type OAuthIntent = 'login' | 'signup';
@@ -280,7 +281,10 @@ async function findOrCreateSocialUser(provider: OAuthProvider, profile: OAuthPro
   );
 
   if (identity.rows.length) {
-    return identity.rows[0] as { id: string; email: string; name: string | null };
+    return {
+      user: identity.rows[0] as { id: string; email: string; name: string | null },
+      created: false,
+    };
   }
 
   const existingUser = await pool.query('SELECT id, email, name FROM users WHERE email = $1', [profile.email]);
@@ -298,6 +302,17 @@ async function findOrCreateSocialUser(provider: OAuthProvider, profile: OAuthPro
       [profile.email, passwordHash, profile.name]
     );
     user = inserted.rows[0];
+    const createdUser = user;
+
+    await pool.query(
+      `INSERT INTO social_identities (user_id, provider, provider_user_id, email, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       ON CONFLICT (provider, provider_user_id)
+       DO UPDATE SET user_id = EXCLUDED.user_id, email = EXCLUDED.email, updated_at = NOW()`,
+      [createdUser.id, provider, profile.providerUserId, profile.email]
+    );
+
+    return { user: createdUser, created: true };
   }
 
   await pool.query(
@@ -308,7 +323,7 @@ async function findOrCreateSocialUser(provider: OAuthProvider, profile: OAuthPro
     [user.id, provider, profile.providerUserId, profile.email]
   );
 
-  return user;
+  return { user, created: false };
 }
 
 // ─── Signup ───────────────────────────────────────────────────────────────────
@@ -342,6 +357,13 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
       userId: user.id,
       source: 'auth_signup',
       metadata: { email: user.email },
+    });
+
+    sendWelcomeEmail({
+      to: user.email,
+      name: user.name,
+    }).catch((error) => {
+      console.error('Welcome email send failed:', error);
     });
 
     res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name } });
@@ -480,7 +502,7 @@ export const oauthExchangeCode = async (req: Request, res: Response): Promise<vo
     const intent = await consumeOAuthState(provider, state);
     const tokenResult = await exchangeOAuthCode(provider, code);
     const profile = await fetchOAuthProfile(provider, tokenResult.accessToken);
-    const user = await findOrCreateSocialUser(provider, profile);
+    const { user, created } = await findOrCreateSocialUser(provider, profile);
 
     const token = signToken({ userId: user.id, email: user.email });
 
@@ -492,6 +514,15 @@ export const oauthExchangeCode = async (req: Request, res: Response): Promise<vo
         intent,
       },
     });
+
+    if (created) {
+      sendWelcomeEmail({
+        to: user.email,
+        name: user.name,
+      }).catch((error) => {
+        console.error('Welcome email send failed:', error);
+      });
+    }
 
     res.json({ token, user: { id: user.id, email: user.email, name: user.name }, provider });
   } catch (err) {
