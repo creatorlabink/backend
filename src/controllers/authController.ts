@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
+import Stripe from 'stripe';
 import pool from '../config/db';
 import { signToken } from '../utils/jwtUtils';
 import { trackEvent } from '../utils/analyticsUtils';
@@ -10,6 +11,45 @@ type OAuthProvider = 'google' | 'tiktok';
 type OAuthIntent = 'login' | 'signup';
 
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
+const EARLY_ADOPTER_PRICE_CENTS = 1197;
+const EARLY_ADOPTER_LABEL = 'Creatorlab – Lifetime Access (Early Adopter)';
+
+let _stripe: Stripe | null = null;
+function getStripe(): Stripe {
+  if (!_stripe) {
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (!key) throw new Error('STRIPE_SECRET_KEY is not set');
+    _stripe = new Stripe(key, { apiVersion: '2026-02-25.clover' });
+  }
+  return _stripe;
+}
+
+async function createRequiredPaymentCheckout(userId: string, email: string): Promise<{ url: string; sessionId: string }> {
+  const session = await getStripe().checkout.sessions.create({
+    payment_method_types: ['card'],
+    mode: 'payment',
+    customer_email: email,
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: EARLY_ADOPTER_PRICE_CENTS,
+          product_data: { name: EARLY_ADOPTER_LABEL },
+        },
+      },
+    ],
+    metadata: { userId },
+    success_url: `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${CLIENT_URL}/auth/login`,
+  });
+
+  if (!session.url) {
+    throw new Error('Stripe checkout session URL missing');
+  }
+
+  return { url: session.url, sessionId: session.id };
+}
 
 const GOOGLE_AUTH_URL = process.env.GOOGLE_OAUTH_AUTHORIZE_URL || 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = process.env.GOOGLE_OAUTH_TOKEN_URL || 'https://oauth2.googleapis.com/token';
@@ -273,7 +313,7 @@ async function findOrCreateSocialUser(provider: OAuthProvider, profile: OAuthPro
   await ensureOAuthTables();
 
   const identity = await pool.query(
-    `SELECT u.id, u.email, u.name
+    `SELECT u.id, u.email, u.name, u.plan
      FROM social_identities si
      JOIN users u ON u.id = si.user_id
      WHERE si.provider = $1 AND si.provider_user_id = $2`,
@@ -282,13 +322,13 @@ async function findOrCreateSocialUser(provider: OAuthProvider, profile: OAuthPro
 
   if (identity.rows.length) {
     return {
-      user: identity.rows[0] as { id: string; email: string; name: string | null },
+      user: identity.rows[0] as { id: string; email: string; name: string | null; plan: string },
       created: false,
     };
   }
 
-  const existingUser = await pool.query('SELECT id, email, name FROM users WHERE email = $1', [profile.email]);
-  let user: { id: string; email: string; name: string | null };
+  const existingUser = await pool.query('SELECT id, email, name, plan FROM users WHERE email = $1', [profile.email]);
+  let user: { id: string; email: string; name: string | null; plan: string };
 
   if (existingUser.rows.length) {
     user = existingUser.rows[0];
@@ -298,7 +338,7 @@ async function findOrCreateSocialUser(provider: OAuthProvider, profile: OAuthPro
     const inserted = await pool.query(
       `INSERT INTO users (email, password_hash, name)
        VALUES ($1, $2, $3)
-       RETURNING id, email, name`,
+       RETURNING id, email, name, plan`,
       [profile.email, passwordHash, profile.name]
     );
     user = inserted.rows[0];
@@ -346,12 +386,12 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
     const hashedPassword = await bcrypt.hash(password, 12);
 
     const result = await pool.query(
-      'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, created_at',
+      'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, plan, created_at',
       [email, hashedPassword, name || null]
     );
 
     const user = result.rows[0];
-    const token = signToken({ userId: user.id, email: user.email });
+    const checkout = await createRequiredPaymentCheckout(user.id, user.email);
 
     await trackEvent('signup', {
       userId: user.id,
@@ -366,7 +406,13 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
       console.error('Welcome email send failed:', error);
     });
 
-    res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name } });
+    res.status(402).json({
+      error: 'payment_required',
+      message: 'Payment is required to activate your account.',
+      checkout_url: checkout.url,
+      session_id: checkout.sessionId,
+      user: { id: user.id, email: user.email, name: user.name, plan: user.plan },
+    });
   } catch (err) {
     console.error('Signup error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -384,7 +430,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
   try {
     const result = await pool.query(
-      'SELECT id, email, name, password_hash FROM users WHERE email = $1',
+      'SELECT id, email, name, plan, password_hash FROM users WHERE email = $1',
       [email]
     );
 
@@ -401,6 +447,17 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    if (user.plan === 'free') {
+      const checkout = await createRequiredPaymentCheckout(user.id, user.email);
+      res.status(402).json({
+        error: 'payment_required',
+        message: 'Payment is required to access CreatorLab.',
+        checkout_url: checkout.url,
+        session_id: checkout.sessionId,
+      });
+      return;
+    }
+
     const token = signToken({ userId: user.id, email: user.email });
 
     await trackEvent('login', {
@@ -409,7 +466,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       metadata: { email: user.email },
     });
 
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan } });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -420,7 +477,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 export const getMe = async (req: Request & { user?: { userId: string; email: string } }, res: Response): Promise<void> => {
   try {
     const result = await pool.query(
-      'SELECT id, email, name, created_at FROM users WHERE id = $1',
+      'SELECT id, email, name, plan, created_at FROM users WHERE id = $1',
       [req.user?.userId]
     );
 
@@ -504,6 +561,17 @@ export const oauthExchangeCode = async (req: Request, res: Response): Promise<vo
     const profile = await fetchOAuthProfile(provider, tokenResult.accessToken);
     const { user, created } = await findOrCreateSocialUser(provider, profile);
 
+    if (user.plan === 'free') {
+      const checkout = await createRequiredPaymentCheckout(user.id, user.email);
+      res.status(402).json({
+        error: 'payment_required',
+        message: 'Payment is required to access CreatorLab.',
+        checkout_url: checkout.url,
+        session_id: checkout.sessionId,
+      });
+      return;
+    }
+
     const token = signToken({ userId: user.id, email: user.email });
 
     await trackEvent('login', {
@@ -524,7 +592,7 @@ export const oauthExchangeCode = async (req: Request, res: Response): Promise<vo
       });
     }
 
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name }, provider });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan }, provider });
   } catch (err) {
     console.error('oauthExchangeCode error:', err);
     res.status(500).json({ error: 'Social login failed. Please try again.' });
