@@ -24,6 +24,24 @@ function getStripe(): Stripe {
   return _stripe;
 }
 
+function asErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  return 'Unknown error';
+}
+
+function isStripeCheckoutError(err: unknown): boolean {
+  const msg = asErrorMessage(err).toLowerCase();
+  return (
+    msg.includes('stripe') ||
+    msg.includes('api key') ||
+    msg.includes('checkout') ||
+    msg.includes('customer_email') ||
+    msg.includes('payment_method') ||
+    msg.includes('no such')
+  );
+}
+
 async function createRequiredPaymentCheckout(userId: string, email: string): Promise<{ url: string; sessionId: string }> {
   const session = await getStripe().checkout.sessions.create({
     payment_method_types: ['card'],
@@ -415,6 +433,13 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
     });
   } catch (err) {
     console.error('Signup error:', err);
+    if (isStripeCheckoutError(err)) {
+      res.status(500).json({
+        error: 'payment_setup_error',
+        message: asErrorMessage(err),
+      });
+      return;
+    }
     res.status(500).json({ error: 'Internal server error' });
   }
 };
@@ -469,6 +494,13 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan } });
   } catch (err) {
     console.error('Login error:', err);
+    if (isStripeCheckoutError(err)) {
+      res.status(500).json({
+        error: 'payment_setup_error',
+        message: asErrorMessage(err),
+      });
+      return;
+    }
     res.status(500).json({ error: 'Internal server error' });
   }
 };
@@ -595,6 +627,13 @@ export const oauthExchangeCode = async (req: Request, res: Response): Promise<vo
     res.json({ token, user: { id: user.id, email: user.email, name: user.name, plan: user.plan }, provider });
   } catch (err) {
     console.error('oauthExchangeCode error:', err);
+    if (isStripeCheckoutError(err)) {
+      res.status(500).json({
+        error: 'payment_setup_error',
+        message: asErrorMessage(err),
+      });
+      return;
+    }
     res.status(500).json({ error: 'Social login failed. Please try again.' });
   }
 };
