@@ -40,7 +40,9 @@ app.use(cors({
   credentials: true,
 }));
 app.post('/api/integrations/celebio/webhook', express.raw({ type: 'application/json' }), celebioWebhook);
+app.post('/integrations/celebio/webhook', express.raw({ type: 'application/json' }), celebioWebhook);
 app.post('/api/notifications/inbound', express.json(), receiveInboundEmail);
+app.post('/notifications/inbound', express.json(), receiveInboundEmail);
 // NOTE: Stripe webhook in payment routes uses its own raw-body parser before this
 
 // ─── Body Parsing (Vercel-compatible) ────────────────────────────────────────
@@ -90,13 +92,21 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/api/auth',    authRoutes);
 app.use('/auth',        authRoutes);
 app.use('/api/ebooks',  ebookRoutes);
+app.use('/ebooks',      ebookRoutes);
 app.use('/api/pdf',     pdfRoutes);
+app.use('/pdf',         pdfRoutes);
 app.use('/api/payment', paymentRoutes);
+app.use('/payment',     paymentRoutes);
 app.use('/api/ai',      aiRoutes);
+app.use('/ai',          aiRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/analytics',     analyticsRoutes);
 app.use('/api/integrations', integrationRoutes);
+app.use('/integrations',     integrationRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/notifications',     notificationRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/admin',     adminRoutes);
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
