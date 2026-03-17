@@ -88,6 +88,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 app.use('/api/auth',    authRoutes);
+app.use('/auth',        authRoutes);
 app.use('/api/ebooks',  ebookRoutes);
 app.use('/api/pdf',     pdfRoutes);
 app.use('/api/payment', paymentRoutes);
