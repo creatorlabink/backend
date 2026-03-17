@@ -580,7 +580,7 @@ export const forgotPassword = async (req: Request, res: Response): Promise<void>
       const user = userResult.rows[0] as { id: string; email: string; name: string | null };
       const rawToken = crypto.randomBytes(32).toString('hex');
       const tokenHash = hashResetToken(rawToken);
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      const expiresAt = new Date(Date.now() + 20 * 60 * 1000);
 
       await pool.query('DELETE FROM password_reset_tokens WHERE user_id = $1 OR expires_at < NOW() OR used_at IS NOT NULL', [user.id]);
       await pool.query(

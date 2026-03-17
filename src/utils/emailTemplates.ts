@@ -106,13 +106,13 @@ export function renderTemplate(key: TemplateKey, input: TemplateRenderInput): Te
       return { subject, html, text: `Hi ${userName}, verify your account: ${actionUrl}` };
     }
     case 'password_reset': {
-      const subject = 'Reset your CreatorLab password';
-      const html = shell('Password reset request', 'Use this link to reset your password.', `
+      const subject = 'Reset your CreatorLab password (expires in 20 minutes)';
+      const html = shell('Password reset request', 'Use this link to reset your password. This link expires in 20 minutes.', `
         <p style="margin:0 0 12px;">Hi ${userName},</p>
-        <p style="margin:0 0 18px;color:${BRAND.muted};">We received a request to reset your password. If this was you, continue below.</p>
+        <p style="margin:0 0 18px;color:${BRAND.muted};">We received a request to reset your password. If this was you, continue below. This link expires in <strong>20 minutes</strong>.</p>
         ${cta('Reset Password', actionUrl)}
       `);
-      return { subject, html, text: `Hi ${userName}, reset your password: ${actionUrl}` };
+      return { subject, html, text: `Hi ${userName}, reset your password using this link (expires in 20 minutes): ${actionUrl}` };
     }
     case 'ebook_export_ready': {
       const subject = `${ebookTitle} is ready to download`;
