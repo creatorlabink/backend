@@ -9,7 +9,17 @@ export type AnalyticsEventName =
   | 'ebook_updated'
   | 'pdf_download'
   | 'template_selected'
-  | 'ai_format_applied';
+  | 'ai_format_applied'
+  | 'page_view'
+  | 'payment_completed'
+  // Feature usage events
+  | 'unveil_session_started'
+  | 'unveil_path_created'
+  | 'unveil_path_revealed'
+  | 'teleprompter_session_started'
+  | 'teleprompter_script_loaded'
+  | 'teleprompter_playback_started'
+  | 'ebook_editor_opened';
 
 export async function trackEvent(
   eventName: AnalyticsEventName,

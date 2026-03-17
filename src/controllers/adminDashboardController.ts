@@ -858,3 +858,122 @@ export const getSystemStatus = async (req: Request, res: Response): Promise<void
     });
   }
 };
+
+// ============================================================================
+// FEATURE USAGE STATISTICS
+// ============================================================================
+
+export const getFeatureUsageStats = async (req: Request, res: Response): Promise<void> => {
+  try {
+    // Total feature usage across all users
+    const totalUsage = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE event_name IN ('unveil_session_started', 'unveil_path_created', 'unveil_path_revealed'))::int AS unveil_total,
+        COUNT(*) FILTER (WHERE event_name = 'unveil_session_started')::int AS unveil_sessions,
+        COUNT(*) FILTER (WHERE event_name = 'unveil_path_created')::int AS unveil_paths_created,
+        COUNT(*) FILTER (WHERE event_name = 'unveil_path_revealed')::int AS unveil_reveals,
+        COUNT(*) FILTER (WHERE event_name IN ('teleprompter_session_started', 'teleprompter_script_loaded', 'teleprompter_playback_started'))::int AS teleprompter_total,
+        COUNT(*) FILTER (WHERE event_name = 'teleprompter_session_started')::int AS teleprompter_sessions,
+        COUNT(*) FILTER (WHERE event_name = 'teleprompter_script_loaded')::int AS teleprompter_scripts_loaded,
+        COUNT(*) FILTER (WHERE event_name = 'teleprompter_playback_started')::int AS teleprompter_playbacks,
+        COUNT(*) FILTER (WHERE event_name IN ('ebook_created', 'ebook_updated', 'ebook_editor_opened'))::int AS ebook_total,
+        COUNT(*) FILTER (WHERE event_name = 'ebook_editor_opened')::int AS ebook_editor_opened,
+        COUNT(*) FILTER (WHERE event_name = 'ebook_created')::int AS ebook_created,
+        COUNT(*) FILTER (WHERE event_name = 'ebook_updated')::int AS ebook_updated,
+        COUNT(*) FILTER (WHERE event_name = 'pdf_download')::int AS pdf_downloads,
+        COUNT(*) FILTER (WHERE event_name = 'ai_format_applied')::int AS ai_formatting_used
+      FROM analytics_events
+    `);
+
+    // Usage by user (top 50 most active)
+    const userUsage = await pool.query(`
+      SELECT 
+        u.id,
+        u.email,
+        u.name,
+        u.plan,
+        COUNT(*) FILTER (WHERE ae.event_name IN ('unveil_session_started', 'unveil_path_created', 'unveil_path_revealed'))::int AS unveil_usage,
+        COUNT(*) FILTER (WHERE ae.event_name IN ('teleprompter_session_started', 'teleprompter_script_loaded', 'teleprompter_playback_started'))::int AS teleprompter_usage,
+        COUNT(*) FILTER (WHERE ae.event_name IN ('ebook_created', 'ebook_updated', 'ebook_editor_opened'))::int AS ebook_usage,
+        COUNT(*) FILTER (WHERE ae.event_name = 'pdf_download')::int AS downloads,
+        COUNT(*)::int AS total_events,
+        MAX(ae.created_at) AS last_activity
+      FROM users u
+      LEFT JOIN analytics_events ae ON u.id = ae.user_id
+      GROUP BY u.id, u.email, u.name, u.plan
+      HAVING COUNT(ae.id) > 0
+      ORDER BY total_events DESC
+      LIMIT 50
+    `);
+
+    // Daily feature usage for the last 30 days
+    const dailyUsage = await pool.query(`
+      SELECT 
+        DATE(created_at) AS date,
+        COUNT(*) FILTER (WHERE event_name LIKE 'unveil%')::int AS unveil,
+        COUNT(*) FILTER (WHERE event_name LIKE 'teleprompter%')::int AS teleprompter,
+        COUNT(*) FILTER (WHERE event_name IN ('ebook_created', 'ebook_updated', 'ebook_editor_opened'))::int AS ebook
+      FROM analytics_events
+      WHERE created_at >= NOW() - INTERVAL '30 days'
+      GROUP BY DATE(created_at)
+      ORDER BY date DESC
+    `);
+
+    // Unique users per feature
+    const uniqueUsers = await pool.query(`
+      SELECT
+        COUNT(DISTINCT CASE WHEN event_name LIKE 'unveil%' THEN user_id END)::int AS unveil_users,
+        COUNT(DISTINCT CASE WHEN event_name LIKE 'teleprompter%' THEN user_id END)::int AS teleprompter_users,
+        COUNT(DISTINCT CASE WHEN event_name IN ('ebook_created', 'ebook_updated', 'ebook_editor_opened') THEN user_id END)::int AS ebook_users
+      FROM analytics_events
+      WHERE user_id IS NOT NULL
+    `);
+
+    const totals = totalUsage.rows[0];
+    const unique = uniqueUsers.rows[0];
+
+    res.json({
+      totals: {
+        unveil: {
+          total: totals.unveil_total ?? 0,
+          sessions: totals.unveil_sessions ?? 0,
+          pathsCreated: totals.unveil_paths_created ?? 0,
+          reveals: totals.unveil_reveals ?? 0,
+          uniqueUsers: unique.unveil_users ?? 0,
+        },
+        teleprompter: {
+          total: totals.teleprompter_total ?? 0,
+          sessions: totals.teleprompter_sessions ?? 0,
+          scriptsLoaded: totals.teleprompter_scripts_loaded ?? 0,
+          playbacks: totals.teleprompter_playbacks ?? 0,
+          uniqueUsers: unique.teleprompter_users ?? 0,
+        },
+        ebook: {
+          total: totals.ebook_total ?? 0,
+          editorOpened: totals.ebook_editor_opened ?? 0,
+          created: totals.ebook_created ?? 0,
+          updated: totals.ebook_updated ?? 0,
+          downloads: totals.pdf_downloads ?? 0,
+          aiFormattingUsed: totals.ai_formatting_used ?? 0,
+          uniqueUsers: unique.ebook_users ?? 0,
+        },
+      },
+      userUsage: userUsage.rows.map(u => ({
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        plan: u.plan,
+        unveilUsage: u.unveil_usage,
+        teleprompterUsage: u.teleprompter_usage,
+        ebookUsage: u.ebook_usage,
+        downloads: u.downloads,
+        totalEvents: u.total_events,
+        lastActivity: u.last_activity,
+      })),
+      dailyUsage: dailyUsage.rows,
+    });
+  } catch (err) {
+    console.error('getFeatureUsageStats error:', err);
+    res.status(500).json({ error: 'Failed to fetch feature usage stats' });
+  }
+};

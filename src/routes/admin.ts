@@ -22,6 +22,7 @@ import {
   getAllEbooks,
   getAuditLogs,
   getSystemStatus,
+  getFeatureUsageStats,
 } from '../controllers/adminDashboardController';
 
 const router = Router();
@@ -47,6 +48,7 @@ router.get('/revenue', getRevenueStats);
 
 // ─── Analytics ──────────────────────────────────────────────────────────────
 router.get('/analytics', getAnalyticsDashboard);
+router.get('/analytics/feature-usage', getFeatureUsageStats);
 
 // ─── Ebook Management ───────────────────────────────────────────────────────
 router.get('/ebooks', getAllEbooks);
