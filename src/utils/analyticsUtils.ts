@@ -3,6 +3,7 @@ import pool from '../config/db';
 export type AnalyticsEventName =
   | 'signup'
   | 'login'
+  | 'password_reset'
   | 'cta_click'
   | 'ebook_created'
   | 'ebook_updated'

@@ -5,7 +5,8 @@ import Stripe from 'stripe';
 import pool from '../config/db';
 import { signToken } from '../utils/jwtUtils';
 import { trackEvent } from '../utils/analyticsUtils';
-import { sendWelcomeEmail } from '../utils/emailUtils';
+import { sendEmail, sendWelcomeEmail } from '../utils/emailUtils';
+import { renderTemplate } from '../utils/emailTemplates';
 
 type OAuthProvider = 'google' | 'tiktok';
 type OAuthIntent = 'login' | 'signup';
@@ -86,6 +87,7 @@ const TIKTOK_REDIRECT_URI = process.env.TIKTOK_REDIRECT_URI || `${CLIENT_URL}/au
 const TIKTOK_SCOPES = process.env.TIKTOK_OAUTH_SCOPES || 'user.info.basic';
 
 let oauthTablesReady = false;
+let passwordResetTableReady = false;
 
 interface OAuthTokenResult {
   accessToken: string;
@@ -97,6 +99,41 @@ interface OAuthProfile {
   providerUserId: string;
   email: string;
   name: string | null;
+}
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function maskEmail(email: string): string {
+  const [local, domain] = email.split('@');
+  if (!local || !domain) return '***';
+  const maskedLocal = local.length <= 2 ? `${local[0]}*` : `${local.slice(0, 2)}***`;
+  return `${maskedLocal}@${domain}`;
+}
+
+function hashResetToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+async function ensurePasswordResetTable(): Promise<void> {
+  if (passwordResetTableReady) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user ON password_reset_tokens(user_id)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires ON password_reset_tokens(expires_at)');
+
+  passwordResetTableReady = true;
 }
 
 async function ensureOAuthTables(): Promise<void> {
@@ -522,6 +559,180 @@ export const getMe = async (req: Request & { user?: { userId: string; email: str
   } catch (err) {
     console.error('GetMe error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ─── Forgot Password ─────────────────────────────────────────────────────────
+export const forgotPassword = async (req: Request, res: Response): Promise<void> => {
+  const rawEmail = req.body?.email;
+  const email = typeof rawEmail === 'string' ? normalizeEmail(rawEmail) : '';
+
+  if (!email) {
+    res.status(400).json({ error: 'Email is required' });
+    return;
+  }
+
+  try {
+    await ensurePasswordResetTable();
+
+    const userResult = await pool.query('SELECT id, email, name FROM users WHERE email = $1 LIMIT 1', [email]);
+    if (userResult.rows.length) {
+      const user = userResult.rows[0] as { id: string; email: string; name: string | null };
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashResetToken(rawToken);
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+      await pool.query('DELETE FROM password_reset_tokens WHERE user_id = $1 OR expires_at < NOW() OR used_at IS NOT NULL', [user.id]);
+      await pool.query(
+        'INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+        [user.id, tokenHash, expiresAt]
+      );
+
+      const actionUrl = `${CLIENT_URL}/auth/reset-password?token=${encodeURIComponent(rawToken)}`;
+      const template = renderTemplate('password_reset', {
+        userName: user.name || 'Creator',
+        actionUrl,
+        appUrl: CLIENT_URL,
+      });
+
+      await sendEmail({
+        to: user.email,
+        subject: template.subject,
+        html: template.html,
+        text: template.text,
+      });
+    }
+
+    res.json({
+      message: 'If an account exists for this email, a password reset link has been sent.',
+    });
+  } catch (err) {
+    console.error('Forgot password error:', err);
+    res.status(500).json({ error: 'Failed to process password reset request.' });
+  }
+};
+
+// ─── Verify Reset Token ──────────────────────────────────────────────────────
+export const verifyResetToken = async (req: Request, res: Response): Promise<void> => {
+  const token = typeof req.query.token === 'string' ? req.query.token : '';
+  if (!token) {
+    res.status(400).json({ error: 'Token is required' });
+    return;
+  }
+
+  try {
+    await ensurePasswordResetTable();
+
+    const tokenHash = hashResetToken(token);
+    const result = await pool.query(
+      `SELECT u.email
+       FROM password_reset_tokens prt
+       JOIN users u ON u.id = prt.user_id
+       WHERE prt.token_hash = $1
+         AND prt.used_at IS NULL
+         AND prt.expires_at >= NOW()
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (!result.rows.length) {
+      res.status(400).json({ error: 'Invalid or expired reset link.' });
+      return;
+    }
+
+    const row = result.rows[0] as { email: string };
+    res.json({ valid: true, email: maskEmail(row.email) });
+  } catch (err) {
+    console.error('Verify reset token error:', err);
+    res.status(500).json({ error: 'Failed to verify reset token.' });
+  }
+};
+
+// ─── Reset Password ──────────────────────────────────────────────────────────
+export const resetPassword = async (req: Request, res: Response): Promise<void> => {
+  const token = typeof req.body?.token === 'string' ? req.body.token : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const confirmPassword = typeof req.body?.confirmPassword === 'string' ? req.body.confirmPassword : '';
+
+  if (!token || !password || !confirmPassword) {
+    res.status(400).json({ error: 'Token, password and confirmation are required.' });
+    return;
+  }
+
+  if (password.length < 8) {
+    res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    return;
+  }
+
+  if (password !== confirmPassword) {
+    res.status(400).json({ error: 'Passwords do not match.' });
+    return;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await ensurePasswordResetTable();
+
+    const tokenHash = hashResetToken(token);
+    await client.query('BEGIN');
+
+    const tokenResult = await client.query(
+      `SELECT prt.id AS token_id, u.id AS user_id, u.email, u.name
+       FROM password_reset_tokens prt
+       JOIN users u ON u.id = prt.user_id
+       WHERE prt.token_hash = $1
+         AND prt.used_at IS NULL
+         AND prt.expires_at >= NOW()
+       FOR UPDATE`,
+      [tokenHash]
+    );
+
+    if (!tokenResult.rows.length) {
+      await client.query('ROLLBACK');
+      res.status(400).json({ error: 'Invalid or expired reset link.' });
+      return;
+    }
+
+    const row = tokenResult.rows[0] as { token_id: string; user_id: string; email: string; name: string | null };
+    const newHash = await bcrypt.hash(password, 12);
+
+    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, row.user_id]);
+    await client.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [row.token_id]);
+    await client.query('DELETE FROM password_reset_tokens WHERE user_id = $1 AND id <> $2', [row.user_id, row.token_id]);
+
+    await client.query('COMMIT');
+
+    await trackEvent('password_reset', {
+      userId: row.user_id,
+      source: 'auth_reset_password',
+      metadata: { email: row.email },
+    });
+
+    const subject = 'Your CreatorLab password was changed';
+    const html = `
+      <div style="font-family: Inter, Arial, sans-serif; line-height: 1.6; color: #111; max-width: 560px; margin: 0 auto;">
+        <h2 style="margin: 0 0 10px;">Password updated successfully</h2>
+        <p style="margin: 0 0 12px;">Hi ${row.name?.trim() || 'Creator'}, your password was just reset.</p>
+        <p style="margin: 0 0 12px;">If this wasn't you, contact <a href="mailto:support@creatorlab.ink">support@creatorlab.ink</a> immediately.</p>
+        <a href="${CLIENT_URL}/auth/login" style="display: inline-block; padding: 10px 16px; background: #4f46e5; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600;">Log in to CreatorLab</a>
+      </div>
+    `;
+
+    await sendEmail({
+      to: row.email,
+      subject,
+      html,
+      text: `Your CreatorLab password was just reset. If this wasn't you, contact support@creatorlab.ink immediately.`,
+    });
+
+    res.json({ message: 'Password reset successful. You can now log in with your new password.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Reset password error:', err);
+    res.status(500).json({ error: 'Failed to reset password.' });
+  } finally {
+    client.release();
   }
 };
 
