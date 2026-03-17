@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 export interface AuthPayload {
   userId: string;
   email: string;
+  impersonatedBy?: string;
 }
 
 export interface AuthRequest extends Request {

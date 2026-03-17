@@ -338,7 +338,7 @@ export const updateUser = async (req: Request, res: Response): Promise<void> => 
     }
 
     updates.push('updated_at = NOW()');
-    params.push(userId);
+    params.push(String(userId));
 
     const query = `
       UPDATE users 
@@ -435,7 +435,7 @@ export const resetUserPassword = async (req: Request, res: Response): Promise<vo
 };
 
 export const impersonateUser = async (req: Request, res: Response): Promise<void> => {
-  const { userId } = req.params;
+  const userId = String(req.params.userId);
   const adminEmail = (req as unknown as { user?: { email?: string } }).user?.email || 'unknown';
 
   try {
