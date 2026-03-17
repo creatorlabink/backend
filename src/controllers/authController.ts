@@ -105,6 +105,18 @@ function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
+function parseAdminEmails(): string[] {
+  return (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isAdminEmail(email: string | null | undefined): boolean {
+  if (!email) return false;
+  return parseAdminEmails().includes(normalizeEmail(email));
+}
+
 function maskEmail(email: string): string {
   const [local, domain] = email.split('@');
   if (!local || !domain) return '***';
@@ -509,7 +521,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    if (user.plan === 'free') {
+    if (user.plan === 'free' && !isAdminEmail(user.email)) {
       const checkout = await createRequiredPaymentCheckout(user.id, user.email);
       res.status(402).json({
         error: 'payment_required',
@@ -804,7 +816,7 @@ export const oauthExchangeCode = async (req: Request, res: Response): Promise<vo
     const profile = await fetchOAuthProfile(provider, tokenResult.accessToken);
     const { user, created } = await findOrCreateSocialUser(provider, profile);
 
-    if (user.plan === 'free') {
+    if (user.plan === 'free' && !isAdminEmail(user.email)) {
       const checkout = await createRequiredPaymentCheckout(user.id, user.email);
       res.status(402).json({
         error: 'payment_required',
